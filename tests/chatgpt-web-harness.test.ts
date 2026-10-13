@@ -368,6 +368,68 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
+  test("parsed native page context starts a tool-capable turn and preserves its environment for follow-up", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-open-page-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: "browser://chatgpt-native-open-page-test",
+      chatgptWeb: { ...toolCapabilities, brokerSocketPath: socketPath, threadEnvironmentStatePath: join(tempRoot, "open-page-environment.json") },
+    };
+    const originalCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = join(tempRoot, "isolated-launcher-codex");
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      expect(turn.capabilities.localToolsEnabled).toBe(true);
+      const prepared = await turn.prepare();
+      expect(prepared.text).toMatch(/turn_token turn_[A-Za-z0-9_-]+/);
+      expect(prepared.text).toContain(browserStarts === 1 ? "Inspect the workspace" : "Continue the inspection");
+      prepared.release();
+      turn.onTextDelta("Page context accepted");
+      return "Page context accepted";
+    };
+    try {
+      const threadId = "thread_native_open_page";
+      const turnId = "turn_native_open_page";
+      const visualizationRoot = resolve(tempRoot, "..", "real-codex-home", "visualizations", "2026", "10", "12", threadId);
+      const message = (role: string, id: string, kind: string, text: string) => ({
+        type: "message", role, id, content: [{ type: "input_text", text }],
+        internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: [kind] },
+      });
+      const wire = {
+        model: CHATGPT_WEB_MODEL_ID, stream: true, reasoning: { effort: "high" },
+        tools: [{ type: "function", name: "exec_command", description: "Run command", parameters: { type: "object" } }],
+        client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId, sandbox: "none", workspaces: { [tempRoot]: {} } }) },
+        input: [
+          message("user", "msg_page_environment", "environments.environment_context", environmentXml.replace("</workspace_roots>", `<root>${visualizationRoot}</root></workspace_roots>`)),
+          message("developer", "msg_time_context", "additional_content.codex_apps_client_time_context", "Current date: 2026-10-12."),
+          message("user", "msg_open_page", "additional_content.codex_apps_open_page", '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>'),
+          message("developer", "msg_page_instructions", "additional_content.codex_apps_open_page_instructions", "The open Page context is not a user request."),
+          message("user", "msg_inspect", "user.text", "Inspect the workspace"),
+        ],
+      };
+      const adapter = createChatGptWebAdapter(provider);
+      for (const request of [wire, {
+        ...wire,
+        client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: "turn_native_page_followup", sandbox: "none", workspaces: { [tempRoot]: {} } }) },
+        input: [{ ...message("user", "msg_followup", "user.text", "Continue the inspection"), internal_chat_message_metadata_passthrough: { turn_id: "turn_native_page_followup", content_item_kinds: ["user.text"] } }],
+      }]) {
+        const events: AdapterEvent[] = [];
+        await adapter.runTurn!(parseRequest(request), { headers: new Headers() }, event => events.push(event));
+        expect(events.some(event => event.type === "text_delta" && event.text === "Page context accepted")).toBe(true);
+        expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      }
+      expect(browserStarts).toBe(2);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = originalCodexHome;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
   test.each([
     [false, false], [true, false], [false, true], [true, true],
   ])("sequential native messages honor fresh conversation=%s and Luna Bigger Context=%s", async (freshConversation, luna) => {
